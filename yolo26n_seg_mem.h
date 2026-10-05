@@ -239,9 +239,9 @@ typedef enum {
     T_output1 = 227,
     T__model_23_Concat_4_output_0 = 228,
     T__model_23_Transpose_output_0 = 229,
-    T__model_23_Split_output_0 = 230,
-    T__model_23_Split_output_1 = 231,
-    T__model_23_Split_output_2 = 232,
+    T__model_23_Slice_2_output_0 = 230,
+    T__model_23_Slice_3_output_0 = 231,
+    T__model_23_Slice_4_output_0 = 232,
     T__model_23_ReduceMax_output_0 = 233,
     T__model_23_TopK_output_0 = 234,
     T__model_23_TopK_output_1 = 235,
@@ -249,13 +249,13 @@ typedef enum {
     T__model_23_GatherElements_output_0 = 237,
     T__model_23_Flatten_output_0 = 238,
     T__model_23_TopK_1_output_0 = 239,
-    T__model_23_Cast_1_output_0 = 240,
-    T__model_23_Unsqueeze_2_output_0 = 241,
+    T__model_23_Cast_2_output_0 = 240,
+    T__model_23_Unsqueeze_1_output_0 = 241,
     T__model_23_Mod_output_0 = 242,
-    T__model_23_Unsqueeze_1_output_0 = 243,
-    T__model_23_Unsqueeze_3_output_0 = 244,
-    T__model_23_GatherElements_1_output_0 = 245,
-    T__model_23_Cast_2_output_0 = 246,
+    T__model_23_GatherElements_1_output_0 = 243,
+    T__model_23_Unsqueeze_2_output_0 = 244,
+    T__model_23_Unsqueeze_3_output_0 = 245,
+    T__model_23_Cast_output_0 = 246,
     T__model_23_Expand_1_output_0 = 247,
     T__model_23_Expand_2_output_0 = 248,
     T__model_23_GatherElements_2_output_0 = 249,
@@ -501,9 +501,9 @@ static const TensorDesc YOLO_TENSOR[T_COUNT] = {
     {2112u, 204800u, 32, 80, 80},  /* t227: 1x32x80x80 */
     {206912u, 77700u, 37, 1, 2100},  /* t228: 1x37x2100 */
     {1105600u, 77700u, 2100, 1, 37},  /* t229: 1x2100x37 */
-    {274112u, 8400u, 2100, 1, 4},  /* t230: 1x2100x4 */
+    {206912u, 8400u, 2100, 1, 4},  /* t230: 1x2100x4 */
     {0u, 2100u, 2100, 1, 1},  /* t231: 1x2100x1 */
-    {206912u, 67200u, 2100, 1, 32},  /* t232: 1x2100x32 */
+    {215312u, 67200u, 2100, 1, 32},  /* t232: 1x2100x32 */
     {282512u, 2100u, 1, 1, 2100},  /* t233: 1x2100 */
     {284624u, 300u, 1, 1, 300},  /* t234: 1x300 */
     {284928u, 300u, 1, 1, 300},  /* t235: 1x300 */
@@ -514,13 +514,13 @@ static const TensorDesc YOLO_TENSOR[T_COUNT] = {
     {608u, 300u, 1, 1, 300},  /* t240: 1x300 */
     {0u, 300u, 300, 1, 1},  /* t241: 1x300x1 */
     {912u, 300u, 1, 1, 300},  /* t242: 1x300 */
-    {1216u, 300u, 300, 1, 1},  /* t243: 1x300x1 */
-    {1520u, 300u, 300, 1, 1},  /* t244: 1x300x1 */
-    {282816u, 300u, 300, 1, 1},  /* t245: 1x300x1 */
-    {608u, 300u, 300, 1, 1},  /* t246: 1x300x1 */
-    {912u, 1200u, 300, 1, 4},  /* t247: 1x300x4 */
+    {1216u, 300u, 1, 1, 300},  /* t243: 1x300 */
+    {608u, 300u, 300, 1, 1},  /* t244: 1x300x1 */
+    {1520u, 300u, 300, 1, 1},  /* t245: 1x300x1 */
+    {282512u, 300u, 300, 1, 1},  /* t246: 1x300x1 */
+    {282816u, 1200u, 300, 1, 4},  /* t247: 1x300x4 */
     {284928u, 9600u, 300, 1, 32},  /* t248: 1x300x32 */
-    {282512u, 1200u, 300, 1, 4},  /* t249: 1x300x4 */
+    {608u, 1200u, 300, 1, 4},  /* t249: 1x300x4 */
     {294528u, 9600u, 300, 1, 32},  /* t250: 1x300x32 */
     {206912u, 11400u, 300, 1, 38},  /* t251: 1x300x38 */
 };

@@ -1,11 +1,11 @@
-/* main.c -- Benchmark em lote: roda o forward em todas as imagens de uma
- * pasta, acumula TP/FP/TN/FN globalmente e imprime IoU/Dice/Prec/Rec
- * globais + metricas de performance (FPS, RAM pico, CPU media).
+/* main.c -- Benchmark em lote, multiprocesso via fork.
  *
  * Uso:
- *   ./yolo_seg <dir_imgs> <dir_masks> [pesos.bin]
+ *   ./yolo_seg <dir_imgs> <dir_masks> [pesos.bin] [n_workers]
  *
- * As mascaras GT sao procuradas por <stem>.png em <dir_masks>.
+ * Cada worker é um processo independente com sua própria arena.
+ * Os pesos são compartilhados via copy-on-write (read-only apos fork).
+ * TP/FP/TN/FN parciais são agregados via mmap compartilhado.
  */
 #include "yolo26n_seg.h"
 #include "image_io.h"
@@ -17,14 +17,15 @@
 #include <string.h>
 #include <dirent.h>
 #include <time.h>
+#include <unistd.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
 
-/* ---------- helpers ---------- */
+/* ---------- helpers (mesmos de antes) ---------- */
 
 static int cmp_str(const void *a, const void *b)
-{
-    return strcmp(*(const char *const *)a, *(const char *const *)b);
-}
+{ return strcmp(*(const char *const *)a, *(const char *const *)b); }
 
 static double now_sec(void)
 {
@@ -33,7 +34,6 @@ static double now_sec(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-/* Tempo de CPU acumulado (user + sys), em segundos. */
 static double cpu_sec(void)
 {
     struct rusage ru;
@@ -42,7 +42,6 @@ static double cpu_sec(void)
          + ((double)ru.ru_utime.tv_usec + (double)ru.ru_stime.tv_usec) * 1e-6;
 }
 
-/* Pico de RSS desde o inicio do processo (Linux: KB). */
 static double peak_ram_mb(void)
 {
     struct rusage ru;
@@ -50,48 +49,44 @@ static double peak_ram_mb(void)
     return (double)ru.ru_maxrss / 1024.0;
 }
 
-static int has_ext(const char *name, const char *ext)
+static int has_ext(const char *n, const char *e)
 {
-    size_t ln = strlen(name), le = strlen(ext);
+    size_t ln = strlen(n), le = strlen(e);
     if (ln < le) return 0;
     for (size_t i = 0; i < le; i++) {
-        char a = name[ln - le + i];
+        char a = n[ln - le + i];
         if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
-        if (a != ext[i]) return 0;
+        if (a != e[i]) return 0;
     }
     return 1;
 }
 
-static int is_image(const char *name)
+static int is_image(const char *n)
 {
-    return has_ext(name, ".jpg")  || has_ext(name, ".jpeg")
-        || has_ext(name, ".png")  || has_ext(name, ".bmp")
-        || has_ext(name, ".tif")  || has_ext(name, ".tiff");
+    return has_ext(n, ".jpg") || has_ext(n, ".jpeg") || has_ext(n, ".png")
+        || has_ext(n, ".bmp") || has_ext(n, ".tif") || has_ext(n, ".tiff");
 }
 
-/* "abc.jpg" -> "abc" */
-static void stem_of(const char *name, char *out, size_t cap)
+static void stem_of(const char *n, char *o, size_t cap)
 {
-    const char *dot = strrchr(name, '.');
-    size_t n = dot ? (size_t)(dot - name) : strlen(name);
-    if (n >= cap) n = cap - 1;
-    memcpy(out, name, n);
-    out[n] = '\0';
+    const char *d = strrchr(n, '.');
+    size_t k = d ? (size_t)(d - n) : strlen(n);
+    if (k >= cap) k = cap - 1;
+    memcpy(o, n, k); o[k] = '\0';
 }
 
-static int load_weights(const char *path)
+static int load_weights(const char *p)
 {
     float *w = (float *)yolo_weights();
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(p, "rb");
     if (!f) return -1;
     size_t n = fread(w, sizeof(float), YOLO_WEIGHTS_FLOATS, f);
     fclose(f);
     return (n == YOLO_WEIGHTS_FLOATS) ? 0 : -1;
 }
 
-/* Acumula TP/FP/TN/FN para a classe "pipe" (foreground). */
-static void accumulate_confusion(const uint8_t *pred, const uint8_t *gt, int n,
-                                 long *tp, long *fp, long *tn, long *fn)
+static void accumulate(const uint8_t *pred, const uint8_t *gt, int n,
+                       long *tp, long *fp, long *tn, long *fn)
 {
     for (int i = 0; i < n; i++) {
         int p = pred[i] != 0, g = gt[i] != 0;
@@ -102,161 +97,201 @@ static void accumulate_confusion(const uint8_t *pred, const uint8_t *gt, int n,
     }
 }
 
+/* ---------- estatisticas por worker (em mmap compartilhado) ---------- */
+
+typedef struct {
+    long    tp, fp, tn, fn;
+    size_t  processed;
+    double  cpu_sum_pct;
+    double  t_infer_total;
+} Stats;
+
+/* ---------- corpo do worker ---------- */
+
+static void run_worker(int wid, int n_workers,
+                       char **files, size_t n_files,
+                       const char *imgs_dir, const char *masks_dir,
+                       Stats *st)
+{
+    memset(st, 0, sizeof(*st));
+
+    static float   input_nchw[3 * 320 * 320];
+    static uint8_t gt_320[320 * 320];
+    static uint8_t pred_mask[320 * 320];
+
+    double cpu_prev  = cpu_sec();
+    double wall_prev = now_sec();
+
+    for (size_t i = (size_t)wid; i < n_files; i += (size_t)n_workers) {
+        char img_path[1024], mask_path[1024], stem[256];
+        snprintf(img_path,  sizeof(img_path),  "%s/%s",    imgs_dir, files[i]);
+        stem_of(files[i], stem, sizeof(stem));
+        snprintf(mask_path, sizeof(mask_path), "%s/%s.png", masks_dir, stem);
+
+        int sw, sh;
+        uint8_t *img = load_image_rgb(img_path, &sw, &sh);
+        if (!img) continue;
+
+        int gw, gh;
+        uint8_t *gt_rgb = load_image_rgb(mask_path, &gw, &gh);
+        if (!gt_rgb) { free_image(img); continue; }
+
+        /* inferencia */
+        double t0 = now_sec();
+        LetterboxInfo lb;
+        letterbox_image_rgb_to_nchw(img, sh, sw, input_nchw, 320, 320, &lb);
+        yolo_forward(input_nchw);
+        decode_mask_for_detection(yolo_output1(), yolo_output0(),
+                                  0, 320, 320, pred_mask);
+        double t1 = now_sec();
+        st->t_infer_total += t1 - t0;
+
+        free_image(img);
+
+        /* GT */
+        uint8_t *gt_gray = (uint8_t *)malloc((size_t)gw * gh);
+        if (!gt_gray) { free_image(gt_rgb); continue; }
+        for (int k = 0; k < gw * gh; k++) {
+            uint8_t r = gt_rgb[k*3 + 0], g = gt_rgb[k*3 + 1], b = gt_rgb[k*3 + 2];
+            gt_gray[k] = (r > 60 && r > g + 30 && r > b + 30) ? 255 : 0;
+        }
+        free_image(gt_rgb);
+        letterbox_mask_nearest(gt_gray, gh, gw, gt_320, 320, 320, &lb);
+        free(gt_gray);
+
+        accumulate(pred_mask, gt_320, 320 * 320,
+                   &st->tp, &st->fp, &st->tn, &st->fn);
+        st->processed++;
+
+        /* CPU amostrado */
+        double cpu_now = cpu_sec(), wall_now = now_sec();
+        double wall_dt = wall_now - wall_prev;
+        if (wall_dt > 0.0) st->cpu_sum_pct += 100.0 * (cpu_now - cpu_prev) / wall_dt;
+        cpu_prev  = cpu_now;
+        wall_prev = wall_now;
+    }
+}
+
 /* ---------- main ---------- */
 
 int main(int argc, char **argv)
 {
     if (argc < 3) {
-        fprintf(stderr, "uso: %s <dir_imgs> <dir_masks> [pesos.bin]\n", argv[0]);
+        fprintf(stderr, "uso: %s <dir_imgs> <dir_masks> [pesos.bin] [n_workers]\n", argv[0]);
         return 1;
     }
 
     const char *imgs_dir     = argv[1];
     const char *masks_dir    = argv[2];
     const char *weights_path = (argc > 3) ? argv[3] : "yolo26n_seg_weights.bin";
+    int n_workers            = (argc > 4) ? atoi(argv[4]) : (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (n_workers < 1) n_workers = 1;
+    if (n_workers > 32) n_workers = 32;
 
     if (load_weights(weights_path) != 0) {
         fprintf(stderr, "falha ao carregar pesos: %s\n", weights_path);
         return 1;
     }
 
-    /* Coleta lista de imagens. */
+    /* enumera imagens */
     DIR *d = opendir(imgs_dir);
     if (!d) { perror("opendir"); return 1; }
 
-    char  **files     = NULL;
-    size_t  n_files   = 0;
-    size_t  cap_files = 0;
+    char **files = NULL;
+    size_t n_files = 0, cap = 0;
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.')   continue;
-        if (!is_image(ent->d_name))  continue;
-        if (n_files == cap_files) {
-            cap_files = cap_files ? cap_files * 2 : 64;
-            files = (char **)realloc(files, cap_files * sizeof(char *));
+        if (ent->d_name[0] == '.') continue;
+        if (!is_image(ent->d_name)) continue;
+        if (n_files == cap) {
+            cap = cap ? cap * 2 : 64;
+            files = (char **)realloc(files, cap * sizeof(char *));
         }
         files[n_files++] = strdup(ent->d_name);
     }
     closedir(d);
 
     if (n_files == 0) {
-        fprintf(stderr, "nenhuma imagem encontrada em %s\n", imgs_dir);
+        fprintf(stderr, "nenhuma imagem em %s\n", imgs_dir);
         return 1;
     }
     qsort(files, n_files, sizeof(char *), cmp_str);
 
-    printf("imagens: %zu\n", n_files);
-    printf("pesos:   %s\n\n", weights_path);
+    if (n_workers > (int)n_files) n_workers = (int)n_files;
 
-    /* Acumuladores globais. */
-    long   tp = 0, fp = 0, tn = 0, fn = 0;
-    size_t n_processed = 0;
+    printf("imagens:   %zu\n", n_files);
+    printf("pesos:     %s\n", weights_path);
+    printf("workers:   %d\n\n", n_workers);
 
-    /* Performance. */
-    double t_infer_total = 0.0;    /* soma dos wall-times (letterbox+forward+decode) */
-    double cpu_sum_pct   = 0.0;    /* soma das amostras de %CPU por imagem */
-    double cpu_prev      = cpu_sec();
-    double wall_prev     = now_sec();
+    /* area compartilhada para estatisticas */
+    Stats *stats = mmap(NULL, n_workers * sizeof(Stats),
+                        PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (stats == MAP_FAILED) { perror("mmap"); return 1; }
 
-    /* Buffers reutilizados entre imagens. */
-    static float   input_nchw[3 * 320 * 320];
-    static uint8_t gt_320[320 * 320];
-    static uint8_t pred_mask[320 * 320];
+    double wall_start = now_sec();
 
-    for (size_t i = 0; i < n_files; i++) {
-        char img_path[1024], mask_path[1024], stem[256];
-        snprintf(img_path,  sizeof(img_path),  "%s/%s",    imgs_dir, files[i]);
-        stem_of(files[i], stem, sizeof(stem));
-        snprintf(mask_path, sizeof(mask_path), "%s/%s.png", masks_dir, stem);
-
-        int src_w, src_h;
-        uint8_t *img = load_image_rgb(img_path, &src_w, &src_h);
-        if (!img) {
-            fprintf(stderr, "\n[skip] imagem: %s\n", img_path);
-            continue;
+    pid_t *pids = (pid_t *)malloc(n_workers * sizeof(pid_t));
+    for (int w = 0; w < n_workers; w++) {
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); return 1; }
+        if (pid == 0) {
+            /* filho: roda e sai */
+            run_worker(w, n_workers, files, n_files, imgs_dir, masks_dir, &stats[w]);
+            _exit(0);
         }
-
-        int gt_w, gt_h;
-        uint8_t *gt_rgb = load_image_rgb(mask_path, &gt_w, &gt_h);
-        if (!gt_rgb) {
-            fprintf(stderr, "\n[skip] mascara: %s\n", mask_path);
-            free_image(img);
-            continue;
-        }
-
-        /* --- Inferencia: letterbox + forward + decode da mascara --- */
-        double t0 = now_sec();
-
-        LetterboxInfo lb;
-        letterbox_image_rgb_to_nchw(img, src_h, src_w, input_nchw, 320, 320, &lb);
-        yolo_forward(input_nchw);
-
-        const float *out0  = yolo_output0();
-        const float *proto = yolo_output1();
-        decode_mask_for_detection(proto, out0, 0, 320, 320, pred_mask);
-
-        double t1 = now_sec();
-        t_infer_total += t1 - t0;
-
-        free_image(img);
-
-        /* --- GT: binariza + letterbox --- */
-        uint8_t *gt_gray = (uint8_t *)malloc((size_t)gt_w * gt_h);
-        if (!gt_gray) { fprintf(stderr, "\nOOM\n"); free_image(gt_rgb); return 1; }
-        for (int k = 0; k < gt_w * gt_h; k++) {
-            uint8_t r = gt_rgb[k*3 + 0];
-            uint8_t g = gt_rgb[k*3 + 1];
-            uint8_t b = gt_rgb[k*3 + 2];
-            gt_gray[k] = (r > 60 && r > g + 30 && r > b + 30) ? 255 : 0;
-        }
-        free_image(gt_rgb);
-        letterbox_mask_nearest(gt_gray, gt_h, gt_w, gt_320, 320, 320, &lb);
-        free(gt_gray);
-
-        /* --- Acumula confusao --- */
-        accumulate_confusion(pred_mask, gt_320, 320 * 320, &tp, &fp, &tn, &fn);
-        n_processed++;
-
-        /* --- Amostra de CPU apos esta imagem (analoga a psutil.cpu_percent) --- */
-        double cpu_now  = cpu_sec();
-        double wall_now = now_sec();
-        double cpu_dt   = cpu_now  - cpu_prev;
-        double wall_dt  = wall_now - wall_prev;
-        if (wall_dt > 0.0) cpu_sum_pct += 100.0 * cpu_dt / wall_dt;
-        cpu_prev  = cpu_now;
-        wall_prev = wall_now;
-
-        printf("\rimagem %zu/%zu", i + 1, n_files);
-        fflush(stdout);
+        pids[w] = pid;
     }
-    printf("\n\n");
+
+    /* pai espera */
+    int rc_any = 0;
+    for (int w = 0; w < n_workers; w++) {
+        int status;
+        waitpid(pids[w], &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) rc_any = 1;
+    }
+
+    double wall_total = now_sec() - wall_start;
+
+    /* agrega */
+    long   tp = 0, fp = 0, tn = 0, fn = 0;
+    size_t n_processed   = 0;
+    double t_infer_total = 0.0;
+    double cpu_sum       = 0.0;
+    for (int w = 0; w < n_workers; w++) {
+        tp += stats[w].tp;
+        fp += stats[w].fp;
+        tn += stats[w].tn;
+        fn += stats[w].fn;
+        n_processed   += stats[w].processed;
+        t_infer_total += stats[w].t_infer_total;
+        cpu_sum       += stats[w].cpu_sum_pct;
+    }
 
     for (size_t i = 0; i < n_files; i++) free(files[i]);
     free(files);
+    free(pids);
 
-    if (n_processed == 0) {
-        fprintf(stderr, "nenhuma imagem processada\n");
-        return 1;
-    }
+    if (n_processed == 0) { fprintf(stderr, "nada processado\n"); return 1; }
 
-    /* --- Metricas globais (acumuladas, nao media de medias) --- */
     const double eps = 1e-7;
     double iou  = (double)tp / ((double)tp + (double)fp + (double)fn + eps);
     double dice = 2.0 * (double)tp / (2.0 * (double)tp + (double)fp + (double)fn + eps);
     double prec = (double)tp / ((double)tp + (double)fp + eps);
     double rec  = (double)tp / ((double)tp + (double)fn + eps);
 
-    /* --- Performance --- */
-    double fps           = (double)n_processed / t_infer_total;
-    double peak_ram      = peak_ram_mb();
-    double avg_cpu_usage = cpu_sum_pct / (double)n_processed;
+    /* FPS agregado: usa wall total, nao soma de tempos dos workers.
+     * t_infer_total/N aqui seria "FPS por worker"; o que queremos e
+     * quantas imagens por segundo o conjunto entregou. */
+    double fps_aggregate = (double)n_processed / wall_total;
+    double cpu_avg       = cpu_sum / (double)n_workers;
+    double peak_ram      = peak_ram_mb() / 1024.0;  /* MB */
 
-    printf("=== Resultado (n=%zu) ===\n", n_processed);
-    printf("IoU=%.4f  Dice=%.4f  Prec=%.4f  Rec=%.4f\n",
-           iou, dice, prec, rec);
+    printf("=== Resultado (n=%zu, workers=%d) ===\n", n_processed, n_workers);
+    printf("IoU=%.4f  Dice=%.4f  Prec=%.4f  Rec=%.4f\n", iou, dice, prec, rec);
     printf("TP=%ld  FP=%ld  TN=%ld  FN=%ld\n", tp, fp, tn, fn);
-    printf("FPS=%.2f  RAM_pico=%.1f MB  CPU=%.1f%%\n",
-           fps, peak_ram, avg_cpu_usage);
+    printf("FPS=%.2f  wall=%.2fs  RAM_pico=%.1f MB  CPU_medio=%.1f%%\n",
+           fps_aggregate, wall_total, peak_ram, cpu_avg);
 
-    return 0;
+    return rc_any;
 }
