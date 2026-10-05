@@ -1,5 +1,5 @@
 CC      := gcc
-CFLAGS  := -std=gnu11 -O2 -march=native -funroll-loops \
+CFLAGS  := -std=gnu11 -O3 -march=native -funroll-loops \
            -Wall -Wextra -Wno-missing-field-initializers
 LDFLAGS := -lm
 
