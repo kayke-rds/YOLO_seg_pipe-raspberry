@@ -1,9 +1,6 @@
 /venv
-/*.onnx
 /dump*
 /*.png
 /*.jpg
-/*.bin
-/*.csv
 /compare*
 /yolo_seg
