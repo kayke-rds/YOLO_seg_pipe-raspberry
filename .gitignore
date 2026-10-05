@@ -1,7 +1,7 @@
-./venv
-./*.onnx
-./dump*
-./*.png
-./*.jpg
-./*.bin
-./*.csv
+/venv
+/*.onnx
+/dump*
+/*.png
+/*.jpg
+/*.bin
+/*.csv
